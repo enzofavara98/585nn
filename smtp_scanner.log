@@ -1,0 +1,12 @@
+2025-08-07 22:49:20,605 - WARNING - File not found: valid.txt
+2025-08-07 22:49:20,605 - WARNING - File not found: users.txt
+2025-08-07 22:49:20,605 - WARNING - File not found: pass.txt
+2025-08-07 22:49:20,605 - WARNING - No users loaded; using empty user for live detection
+2025-08-07 22:49:20,605 - WARNING - No passwords loaded; using empty password for live detection
+2025-08-07 22:49:20,605 - INFO - Loaded 1 users and 1 passwords
+2025-08-07 22:49:20,605 - INFO - Starting SMTP scanner with 10 threads
+2025-08-07 22:49:20,605 - INFO - Notification mode: WORKING VALID SMTPs only (Live + Authenticated)
+2025-08-07 22:49:20,608 - WARNING - File not found: ips.txt
+2025-08-07 22:49:20,608 - INFO - Processing 0 combinations across 0 hosts and ports [25, 587, 465, 2525]
+2025-08-07 22:49:20,608 - INFO - Scanning completed
+2025-08-07 22:49:20,608 - INFO - No working valid SMTP servers found
