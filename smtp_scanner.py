@@ -369,6 +369,41 @@ def detect_smtp_provider(host: str, port: int, mode: str, timeout: int) -> tuple
         provider = 'Amazon SES'
         evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
 
+    # Xserver (JP) heuristics
+    elif (
+        'xserver.ne.jp' in banner_lc or 'xserver.ne.jp' in ehlo_lc or
+        'xserver.jp' in banner_lc or 'xserver.jp' in ehlo_lc or
+        ('xserver.ne.jp' in rdns_lc if rdns_lc else False) or
+        any('xserver.ne.jp' in n or 'xserver.jp' in n for n in cert_names)
+    ):
+        provider = 'Xserver (JP)'
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
+
+    # Sakura Internet (JP) heuristics
+    elif (
+        'sakura.net.jp' in banner_lc or 'sakura.net.jp' in ehlo_lc or
+        'sakura.ne.jp' in banner_lc or 'sakura.ne.jp' in ehlo_lc or
+        'sakura.ad.jp' in banner_lc or 'sakura.ad.jp' in ehlo_lc or
+        'sakurainternet' in banner_lc or 'sakurainternet' in ehlo_lc or
+        ('sakura.net.jp' in rdns_lc if rdns_lc else False) or
+        ('sakura.ne.jp' in rdns_lc if rdns_lc else False) or
+        ('sakura.ad.jp' in rdns_lc if rdns_lc else False) or
+        any(('sakura.net.jp' in n) or ('sakura.ne.jp' in n) or ('sakura.ad.jp' in n) or ('sakurainternet' in n) for n in cert_names)
+    ):
+        provider = 'Sakura (JP)'
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
+
+    # BIGLOBE (JP) heuristics
+    elif (
+        'biglobe.jp' in banner_lc or 'biglobe.jp' in ehlo_lc or
+        'biglobe.ne.jp' in banner_lc or 'biglobe.ne.jp' in ehlo_lc or
+        ('biglobe.jp' in rdns_lc if rdns_lc else False) or
+        ('biglobe.ne.jp' in rdns_lc if rdns_lc else False) or
+        any('biglobe.jp' in n or 'biglobe.ne.jp' in n for n in cert_names)
+    ):
+        provider = 'BIGLOBE (JP)'
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
+
     evidence_str = "; ".join([e[:300] for e in evidence if e])
     return provider, evidence_str
 
