@@ -16,6 +16,8 @@ import argparse
 import signal
 import ssl
 import re
+import gzip
+from typing import Iterator
 
 # --- SMTP CONFIGURATION (EDIT THESE or set environment variables) ---
 SMTP_SERVER = os.getenv('SMTP_SERVER', "mail.globalhouse.co.th")
@@ -55,6 +57,7 @@ PORT_LIST = [25, 587, 465, 2525]
 CONNECT_TIMEOUT_SECONDS = 10
 QUEUE_MAXSIZE = 100000
 PROVIDER_DETECTION_MODE = 'fast'  # off|fast|full
+IPS_PATH = 'ips.txt'
 
 
 def load_notification_history():
@@ -98,6 +101,7 @@ parser = argparse.ArgumentParser(description='SMTP Scanner')
 parser.add_argument('threads', type=int, help='Number of threads')
 parser.add_argument('verbose', choices=['good', 'bad'], help='Verbosity level')
 parser.add_argument('debug', choices=['d1', 'd2', 'd3', 'd4'], help='Debug level')
+parser.add_argument('--ips', default='ips.txt', help="Path to IP/host list file; use '-' for stdin; supports .gz")
 parser.add_argument('--ports', default='25,587,465,2525', help='Comma-separated list of ports to scan')
 parser.add_argument('--timeout', type=int, default=10, help='Socket connect timeout in seconds')
 parser.add_argument('--queue-size', type=int, default=100000, help='Max queue size for hosts')
@@ -119,7 +123,6 @@ cracked = set()
 try:
     PORT_LIST = [int(p.strip()) for p in args.ports.split(',') if p.strip()]
     if not any(p in (25, 587) for p in PORT_LIST):
-        # Ensure 25 and 587 are present as requested
         PORT_LIST = sorted(set(PORT_LIST + [25, 587]))
 except Exception:
     PORT_LIST = [25, 587, 465, 2525]
@@ -127,6 +130,7 @@ CONNECT_TIMEOUT_SECONDS = max(1, int(args.timeout))
 QUEUE_MAXSIZE = max(1000, int(args.queue_size))
 PROVIDER_DETECTION_MODE = args.provider_detection
 THROTTLE_DELAY_SECONDS = max(0.0, float(args.throttle))
+IPS_PATH = args.ips
 
 
 def load_lines(filename):
@@ -140,6 +144,30 @@ def load_lines(filename):
     except FileNotFoundError:
         logger.warning(f"File not found: {filename}")
     return lines
+
+
+def stream_hosts(path: str) -> Iterator[str]:
+    """Yield hosts line-by-line without loading entire file into memory.
+    Supports '-' for stdin and .gz files.
+    """
+    if path == '-':
+        for line in sys.stdin:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                yield line
+        return
+
+    opener = gzip.open if path.endswith('.gz') else open
+    mode = 'rt'
+    try:
+        with opener(path, mode, encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    yield line
+    except FileNotFoundError:
+        logger.warning(f"File not found: {path}")
+        return
 
 
 def can_send_notification(host):
@@ -593,13 +621,16 @@ def main(thread_number):
             thread.daemon = True
             thread.start()
 
-        hosts = load_lines('ips.txt')
-        total_hosts = len(hosts)
-        logger.info(f"Enqueuing {total_hosts} hosts; ports={PORT_LIST}; users={len(USERS_LIST)}; passwords={len(PASSWORDS_LIST)}; provider_detection={PROVIDER_DETECTION_MODE}; timeout={CONNECT_TIMEOUT_SECONDS}s")
+        logger.info(f"Streaming hosts from {IPS_PATH}; ports={PORT_LIST}; users={len(USERS_LIST)}; passwords={len(PASSWORDS_LIST)}; provider_detection={PROVIDER_DETECTION_MODE}; timeout={CONNECT_TIMEOUT_SECONDS}s")
 
-        for host in hosts:
-            if host.strip():
-                q.put(host.strip())
+        enq = 0
+        start_time = time.time()
+        for host in stream_hosts(IPS_PATH):
+            q.put(host)
+            enq += 1
+            if enq % 10000 == 0:
+                rate = enq / max(0.001, (time.time() - start_time))
+                logger.info(f"Enqueued {enq} hosts (rate ~{rate:.0f}/s)")
 
         q.join()
         logger.info("Scanning completed")
